@@ -1,12 +1,12 @@
 import { type NextRequest, NextResponse } from "next/server";
-import { createAdminClient } from "@/lib/supabase/admin";
+import { createServerClient } from "@supabase/auth-helpers-nextjs";
+import { cookies } from "next/headers";
 import {
   sendTelegramMessage,
   buildTopupNotificationMessage,
 } from "@/lib/telegram/notify";
  
 // ── Supabase webhook payload shape ────────────────────────────────────────────
- 
 interface SupabaseWebhookPayload {
   type: "INSERT" | "UPDATE" | "DELETE";
   table: string;
@@ -25,9 +25,6 @@ interface SupabaseWebhookPayload {
 }
  
 // ── Security: Verify webhook secret ──────────────────────────────────────────
-// Supabase sends the secret in the x-webhook-secret header.
-// We configured this value when creating the webhook in the dashboard.
- 
 function verifyWebhookSecret(request: NextRequest): boolean {
   const secret = request.headers.get("x-webhook-secret");
   const expectedSecret = process.env.SUPABASE_WEBHOOK_SECRET;
@@ -44,8 +41,6 @@ function verifyWebhookSecret(request: NextRequest): boolean {
   }
  
   // Timing-safe string comparison to prevent timing attacks
-  // (even though webhook secrets are not as critical as HMAC,
-  //  it's good practice)
   const secretBuffer = Buffer.from(secret);
   const expectedBuffer = Buffer.from(expectedSecret);
  
@@ -62,13 +57,10 @@ function verifyWebhookSecret(request: NextRequest): boolean {
 }
  
 // ── Route handler ─────────────────────────────────────────────────────────────
- 
 export async function POST(request: NextRequest) {
   // ── 1. Verify webhook secret ──────────────────────────────────────────
   if (!verifyWebhookSecret(request)) {
     console.warn("[topup-notify] Rejected: invalid webhook secret.");
-    // Return 200 to prevent Supabase from retrying (it will retry on non-2xx)
-    // We return a specific message so logs are clear about what happened.
     return NextResponse.json(
       { error: "Invalid webhook secret" },
       { status: 401 }
@@ -90,7 +82,6 @@ export async function POST(request: NextRequest) {
     payload.table !== "topup_requests" ||
     payload.schema !== "public"
   ) {
-    // Not our event — acknowledge and ignore
     return NextResponse.json({ received: true, processed: false });
   }
  
@@ -100,31 +91,45 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "No record in payload" }, { status: 400 });
   }
  
-  // Double-check: only notify for pending requests
+  // Only notify for pending requests
   if (record.status !== "pending") {
     return NextResponse.json({ received: true, processed: false, reason: "Not pending" });
   }
  
-  // ── 4. Fetch user profile for notification context ────────────────────
-  // The webhook payload only contains the topup_requests row.
-  // We need to join profiles to get the username/email.
-  const adminClient = createAdminClient();
+  // ── 4. Setup Supabase Client ─────────────────────────────────────────
+  const cookieStore = await cookies();
+  const supabase = createServerClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    {
+      cookies: {
+        get(name: string) {
+          return cookieStore.get(name)?.value;
+        },
+        set(name: string, value: string, options: any) {
+          cookieStore.set({ name, value, ...options });
+        },
+        remove(name: string, options: any) {
+          cookieStore.set({ name, value: "", ...options });
+        },
+      },
+    }
+  );
  
-  const { data: userProfile } = await adminClient
+  // Fetch user profile for notification context
+  const { data: userProfile } = await supabase
     .from("profiles")
     .select("email, username")
     .eq("id", record.user_id)
     .single();
  
   // ── 5. Generate signed URL for payment proof ──────────────────────────
-  // Valid for 1 hour — admin should review promptly
   let proofSignedUrl: string | null = null;
  
   if (record.payment_proof) {
-    // payment_proof format: "topup-proofs/{userId}/{filename}"
     const storagePath = record.payment_proof.replace(/^topup-proofs\//, "");
  
-    const { data: signedData } = await adminClient.storage
+    const { data: signedData } = await supabase.storage
       .from("topup-proofs")
       .createSignedUrl(storagePath, 3600);
  
@@ -147,13 +152,11 @@ export async function POST(request: NextRequest) {
   const result = await sendTelegramMessage(message);
  
   if (!result.success) {
-    // Log the failure but still return 200 to Supabase
-    // (we don't want Supabase to retry just because Telegram is slow)
     console.error("[topup-notify] Telegram send failed:", result.error);
  
-    // Insert a fallback notification in DB so admin sees it in panel
-    await adminClient.from("notifications").insert({
-      user_id: record.user_id,   // Not ideal but ensures visibility
+    // Fallback notification dalam database
+    await supabase.from("notifications").insert({
+      user_id: record.user_id,   
       type: "admin_message",
       title: "⚠️ Telegram Alert Failed",
       body: `Failed to send Telegram notification for topup #${record.id.slice(0, 8)}. Reason: ${result.error}`,
@@ -181,7 +184,6 @@ export async function POST(request: NextRequest) {
   });
 }
  
-// Supabase webhooks always use POST — disallow other methods
 export async function GET() {
   return NextResponse.json({ error: "Method not allowed" }, { status: 405 });
 }
